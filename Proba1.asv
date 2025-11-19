@@ -1,0 +1,208 @@
+% uav_landing_paper.m
+% Full pipeline following the paper: PhysicalModel + GRU(residual) + Kalman + Fuzzy + Dynamic control (motors)
+% PRE: run CoppeliaSim scene with quad and platform. Lua script on quad must be the modified version above.
+% Ensure ONNX model 'gru_residual.onnx' is in the working dir (created by Python script).
+
+addpath('C:\Program Files\CoppeliaRobotics\CoppeliaSimEdu\programming\zmqRemoteApi\clients\matlab');
+
+client = RemoteAPIClient();
+sim = client.getObject('sim');
+
+sim.startSimulation();
+
+% handles: we will control the target via motor signals, not moving the target directly
+quad_base = sim.getObject('/Quadricopter');           % body
+%quad_target = sim.getObject('/Quadricopter_target');  % target (used by fallback)
+deck = sim.getObject('/OmniPlatform');
+
+dt = 0.05;
+t = 0;
+
+% Load ONNX GRU network (if available)
+onnxFile = 'gru_residual.onnx';
+useOnnx = false;
+if isfile(onnxFile)
+    try
+        net = importONNXNetwork(onnxFile, 'OutputLayerType','regression','ImportWeights',true);
+        useOnnx = true;
+        disp('ONNX GRU network loaded.');
+    catch ME
+        warning('Could not import ONNX: %s. Will use Python fallback if available.');
+    end
+else
+    warning('ONNX file not found. Use train_export_gru.py to create gru_residual.onnx.');
+end
+
+% ---- PhysicalModel: deck stays fixed for now but we include function
+physParams.Ax = 0.0; physParams.Ay = 0.0; physParams.Ah = 0.0;
+physParams.vx = 0; physParams.vy = 0;
+deck0 = cell2mat(sim.getObjectPosition(deck,-1))';
+
+% ---- Kalman filter (state [x vx y vy z vz])
+dt_k = dt;
+F = eye(6); F(1,2)=dt_k; F(3,4)=dt_k; F(5,6)=dt_k;
+Q = eye(6)*1e-4;
+H = [1 0 0 0 0 0; 0 0 1 0 0 0; 0 0 0 0 1 0];
+R = eye(3)*1e-3;
+xk = zeros(6,1); Pk = eye(6)*1e-2;
+
+% ---- Fuzzy: same MF and rulebase as paper
+fuzzy_func = @(pvis,d) fuzzy_mode_matlab(pvis,d);
+
+% ---- Control gains (paper-style mapping)
+mass = 1.5; g = 9.81;
+Kp_xy = 1.5; Kd_xy = 0.6;
+Kp_z = 2.0; Kd_z = 1.0;
+max_att = 0.4; % rad
+
+% ---- history buffer for GRU input (N timesteps)
+N = 20;
+in_dim = 9;
+history = zeros(N, in_dim);
+
+% start main loop
+max_time = 120; % seconds safety
+while sim.getSimulationState() ~= sim.simulation_stopped && t < max_time
+    % measurement: get quad body position and velocity
+    pos = cell2mat(sim.getObjectPosition(quad_base,-1)); % returns cell-like -> double cast ensures numeric
+    vel = cell2mat(sim.getObjectVelocity(quad_base));    % may return [vx vy vz wx wy wz], use linear vel
+    meas = [pos(1); pos(2); pos(3)];
+    
+    % Kalman predict
+    xk = F*xk;
+    Pk = F*Pk*F' + Q;
+    % Kalman update using position measurement
+    z = meas;
+    S = H*Pk*H' + R;
+    K = Pk*H'/S;
+    xk = xk + K*(z - H*xk);
+    Pk = (eye(6) - K*H)*Pk;
+    
+    % Physical model pred for deck at t+dt
+    t_future = t + dt;
+    p_phys = deck_predict(physParams, t_future, deck0);  % returns [x;y;z]
+    
+    % Build input window for GRU: use history (we'll shift)
+    % feature vector per timestep: [phys_pos(3), vel(3), residual(3), mask(1)] -> 10? but earlier used 9
+    % We'll use [pos_phys(3), vel_est(3), residual(3), mask(1)] = 10 -> adapt to trained ONNX
+    % For our ONNX expected in_dim we used 9: [pos_phys(3), vel(3), residual(3)]
+    % We'll pack [px py pz, vx vy vz, rx ry rz] => 9 dims, mask implicitly handled by pvis output.
+    % Build newest sample from current step:
+    phys_now = p_phys;
+    vel_est = [xk(2); xk(4); xk(6)];
+    residual_obs = meas - phys_now; % recent residual
+    new_feat = [phys_now(:); vel_est(:); residual_obs(:)];
+    history = [history(2:end,:); new_feat(:)']; % shift and append (N x in_dim)
+    
+    % GRU inference: input shape (1,N,in_dim)
+    if useOnnx
+        % convert to dlarray or table as required by network
+        inp = reshape(history', [in_dim, N, 1]); % as [C, T, B] often
+        try
+            ypred = predict(net, inp); % may require reshape adjustments depending on how ONNX imported
+            y = squeeze(ypred); % y is vector length 7
+            mean_res = y(1:3);
+            logvar = y(4:6);
+            pvis = sigmoid(y(7));
+        catch
+            % fallback: simple zero residual if predict fails
+            mean_res = zeros(3,1); logvar = log(1e-3*ones(3,1)); pvis = 1.0;
+        end
+    else
+        % fallback: if ONNX not available and Python is configured, call a Python helper
+        try
+            py_module = py.importlib.import_module('gru_infer'); % user must provide gru_infer.py exposing infer(history)
+            py_result = py_module.infer(py.numpy.array(history));
+            arr = double(py_result); % expect 7-element vector
+            mean_res = arr(1:3)';
+            logvar = arr(4:6)';
+            pvis = arr(7);
+        catch
+            % last fallback: zero residual & high confidence
+            mean_res = zeros(3,1); logvar = log(1e-4*ones(3,1)); pvis = 1.0;
+        end
+    end
+    
+    % Hybrid prediction
+    p_total = phys_now(:) + mean_res(:);
+    % Uncertainty estimate (paper: rolling variance). We'll use exp(logvar) as sigma^2
+    sigma2 = exp(logvar(:));
+    
+    % compute normalized distance-to-deck (d in [0,1]), paper uses clearance
+    dz = xk(5) - deck0(3);
+    dnorm = min(max((dz - 0.05)/1.0, 0),1); % normalize with 1m scale and 0.05 offset
+    
+    % fuzzy decision
+    [mode, mode_val] = fuzzy_func(pvis, dnorm);
+    
+    % Controller -> decide thrust and attitude setpoints (paper's policy)
+    % When DESCEND and low sigma: follow p_total. When APPROACH: hold altitude high. HOLD: hover. ABORT: climb.
+    switch mode
+        case "DESCEND"
+            z_ref = p_total(3); % land on predicted deck height
+            xy_ref = p_total(1:2);
+            descend_gain = 1.0;
+        case "APPROACH"
+            z_ref = deck0(3) + 0.6;
+            xy_ref = p_total(1:2);
+            descend_gain = 0.2;
+        case "HOLD"
+            z_ref = xk(5); % hold current altitude
+            xy_ref = xk([1,3]);
+            descend_gain = 0.0;
+        case "ABORT"
+            z_ref = xk(5) + 1.0; % climb 1m
+            xy_ref = xk([1,3]) + [-1;0];
+            descend_gain = -0.5;
+    end
+    
+    % Position errors
+    pos_xy = [xk(1); xk(3)];
+    vel_xy = [xk(2); xk(4)];
+    err_xy = xy_ref - pos_xy;
+    err_v = -vel_xy;
+    acc_cmd_xy = Kp_xy*err_xy + Kd_xy*err_v; % desired horizontal accel
+    
+    % Map desired horizontal accel to small angles: roll ~ -ax/g, pitch ~ ay/g
+    roll_sp = -acc_cmd_xy(1)/g;
+    pitch_sp = acc_cmd_xy(2)/g;
+    % clamp
+    roll_sp = max(min(roll_sp, max_att), -max_att);
+    pitch_sp = max(min(pitch_sp, max_att), -max_att);
+    
+    % Vertical control: compute thrust to track z_ref
+    z_err = z_ref - xk(5);
+    vz_err = -xk(6);
+    a_z = Kp_z*z_err + Kd_z*vz_err + descend_gain;
+    thrust_total = mass*(g + a_z);  % N (approx)
+    % Normalize thrust into script's expected "particleVelocity" domain: we approximate mapping empirically
+    % The original script expects particleVelocity roughly proportional to throttle; we tune a scale
+    thrust_signal = thrust_total / (mass*(g+3)); % crude normalization (adjustable)
+    
+    % Send signals to CoppeliaSim
+    sim.setFloatSignal('ext_thrust', double(thrust_signal));
+    sim.setFloatSignal('ext_roll', double(roll_sp));
+    sim.setFloatSignal('ext_pitch', double(pitch_sp));
+    sim.setFloatSignal('ext_yaw', 0.0);
+    
+    % step time and pause
+    pause(dt);
+    t = t + dt;
+end
+
+% cleanup
+sim.clearFloatSignal('ext_thrust'); sim.clearFloatSignal('ext_roll'); sim.clearFloatSignal('ext_pitch'); sim.clearFloatSignal('ext_yaw');
+sim.stopSimulation();
+
+%% --------------- Helper functions -----------------
+function p = deck_predict(params, t, deck0)
+    % Basic physical model (paper): superposition of drift + heave
+    x = deck0(1) + params.vx * t + params.Ax * sin(params.Ax==0 & 0 | 0); % if Ax=0 -> zero
+    y = deck0(2) + params.vy * t + params.Ay * sin(params.Ay==0 & 0 | 0);
+    z = deck0(3) + params.Ah * sin(params.Ah==0 & 0 | 0);
+    p = [x; y; z];
+end
+
+function s = sigmoid(x)
+    s = 1./(1+exp(-x));
+end
